@@ -26,10 +26,32 @@ tickers_input = st.text_input("Ingresá los tickers separados por coma:", ticker
 correr = st.button("🚀 Correr análisis", type="primary")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def obtener_tipo_cambio(moneda_origen, moneda_destino):
+    """Obtiene el tipo de cambio moneda_origen -> moneda_destino vía Yahoo Finance."""
+    if moneda_origen == moneda_destino:
+        return 1.0
+    par = f"{moneda_origen}{moneda_destino}=X"
+    tasa = yf.Ticker(par).history(period="5d")['Close']
+    if tasa.empty:
+        raise ValueError(f"No se pudo obtener el tipo de cambio {par}")
+    return tasa.iloc[-1]
+
+
 def analizar_ticker(ticker, wacc, tasa_perpetua, crecimiento_min, crecimiento_max):
     empresa = yf.Ticker(ticker)
+    info = empresa.info
 
     precio_actual = empresa.history(period="1d")['Close'].iloc[-1]
+
+    # Moneda de cotización vs moneda de los estados financieros.
+    # Empresas extranjeras que cotizan como ADR en EE.UU. (ej: TSM, NVO) suelen
+    # reportar sus estados financieros en moneda local aunque el precio esté en USD.
+    moneda_cotizacion = info.get('currency', 'USD')
+    moneda_financiera = info.get('financialCurrency', moneda_cotizacion)
+    tipo_cambio = 1.0
+    if moneda_cotizacion != moneda_financiera:
+        tipo_cambio = obtener_tipo_cambio(moneda_financiera, moneda_cotizacion)
 
     flujo_caja = empresa.cashflow
     estado_resultados = empresa.financials
@@ -40,6 +62,10 @@ def analizar_ticker(ticker, wacc, tasa_perpetua, crecimiento_min, crecimiento_ma
         fcf_actual = flujo_caja.loc['Operating Cash Flow'].iloc[0]
     else:
         raise ValueError("No se encontró Free Cash Flow ni Operating Cash Flow")
+
+    # Convertir el FCF a la moneda de cotización antes de proyectar,
+    # para que el valor intrínseco resultante sea comparable al precio de mercado.
+    fcf_actual *= tipo_cambio
 
     ventas = estado_resultados.loc['Total Revenue']
     tasa_crecimiento = (ventas.iloc[0] - ventas.iloc[1]) / ventas.iloc[1]
@@ -74,6 +100,8 @@ def analizar_ticker(ticker, wacc, tasa_perpetua, crecimiento_min, crecimiento_ma
         "Valor Intrínseco": round(valor_intrinseco_accion, 2),
         "Margen Seguridad %": round(margen_seguridad, 1),
         "Crecimiento Usado %": round(tasa_crecimiento * 100, 1),
+        "Moneda": moneda_cotizacion,
+        "Conversión aplicada": f"{moneda_financiera}→{moneda_cotizacion} ({tipo_cambio:.4f})" if tipo_cambio != 1.0 else "—",
     }
 
 
@@ -110,6 +138,15 @@ if correr:
                     return "❌ Sobrevalorada"
 
             df["Veredicto"] = df["Margen Seguridad %"].apply(clasificar)
+
+            convertidos = df[df["Conversión aplicada"] != "—"]
+            if not convertidos.empty:
+                st.info(
+                    "💱 " + ", ".join(convertidos["Ticker"].tolist())
+                    + " reportan estados financieros en una moneda distinta a su precio de cotización. "
+                    "Se aplicó conversión automática para que el valor intrínseco sea comparable, "
+                    "pero verificá el resultado con otra fuente antes de confiar en él al 100%."
+                )
 
             st.subheader("📊 Resultados")
             st.dataframe(
